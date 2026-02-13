@@ -56,7 +56,7 @@ jobs:
           environment-name: test-cross-account-iam
           version-label: test-${{ github.run_number }}
           deployment-package-path: application.zip
-          solution-stack-name: "64bit Amazon Linux 2023 v4.3.0 running Python 3.11"
+          solution-stack-name: "64bit Amazon Linux 2023 v4.9.3 running Python 3.11"
           create-environment-if-not-exists: true
           create-application-if-not-exists: true
           wait-for-deployment: true
